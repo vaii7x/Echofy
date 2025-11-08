@@ -1,0 +1,782 @@
+"""
+echofi_photo_share_ai_rebranded.py
+
+Echofi — Chat + Photo sharing + Echofi AI image Q&A (rebranded).
+Everything optional (voice/camera/Echofi AI) — same features as before,
+but all AI messages and labels say "Echofi" instead of "Gemini".
+
+Usage:
+    python echofi_photo_share_ai_rebranded.py
+
+Optional dependencies:
+    pip install google-generativeai speechrecognition pyttsx3 opencv-python pillow
+    pip install pipwin
+    pipwin install pyaudio
+
+Configuration:
+    - Place your Echofi AI (Gemini) API key in API_KEY variable to enable image Q&A.
+"""
+
+import socket
+import threading
+import time
+import sys
+import os
+import base64
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox
+from datetime import datetime
+
+# Optional libs
+try:
+    import google.generativeai as genai
+except Exception:
+    genai = None
+
+try:
+    import speech_recognition as sr
+except Exception:
+    sr = None
+
+try:
+    import pyttsx3
+except Exception:
+    pyttsx3 = None
+
+try:
+    import cv2
+except Exception:
+    cv2 = None
+
+try:
+    from PIL import Image, ImageTk
+except Exception:
+    Image = ImageTk = None
+
+# ---------------- CONFIG ----------------
+CHAT_PORT = 37021
+BROADCAST_PORT = 37022
+BUFFER_SIZE = 8192
+API_KEY = "AIzaSyBeH8Wn5WZvR0D3Fh61PI25qHvyRMjdrSY"   # <-- Put Echofi AI (Gemini) API key here to enable image Q&A (optional)
+ECHOFI_MODEL = "gemini-2.5-flash"  # model name used by google-generativeai
+SOCKET_TIMEOUT = 20.0
+DISCOVER_INTERVAL = 1.0
+RECONNECT_DELAY = 3.0
+
+PHOTOS_DIR = "photos"
+RECV_PHOTOS_DIR = "received_photos"
+os.makedirs(PHOTOS_DIR, exist_ok=True)
+os.makedirs(RECV_PHOTOS_DIR, exist_ok=True)
+
+# ---------------- Helpers ----------------
+def thread(fn, *a, **kw):
+    t = threading.Thread(target=fn, args=a, kwargs=kw, daemon=True)
+    t.start()
+    return t
+
+def now_ts():
+    return datetime.now().strftime("%H:%M:%S")
+
+def get_local_ip():
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except Exception:
+        return "127.0.0.1"
+
+# ---------------- EchofiAI wrapper (lazy) ----------------
+class EchofiAI:
+    def __init__(self, api_key, model=ECHOFI_MODEL):
+        if genai is None:
+            raise RuntimeError("google-generativeai not installed")
+        genai.configure(api_key=api_key)
+        self.model = genai.GenerativeModel(model)
+    def reply(self, prompt: str) -> str:
+        r = self.model.generate_content(prompt)
+        return getattr(r, "text", str(r))
+    # Note: image multimodal support may require different GenAI calls; base64-in-prompt is a pragmatic fallback.
+
+# ---------------- Voice utilities (optional) ----------------
+class VoiceEngine:
+    def __init__(self):
+        self.recognizer = sr.Recognizer() if sr else None
+        self.tts = None
+        if pyttsx3:
+            try:
+                self.tts = pyttsx3.init()
+            except Exception:
+                self.tts = None
+    def listen_once(self, timeout=5, phrase_time_limit=8):
+        if not self.recognizer:
+            raise RuntimeError("SpeechRecognition not available")
+        with sr.Microphone() as mic:
+            self.recognizer.adjust_for_ambient_noise(mic, duration=0.4)
+            audio = self.recognizer.listen(mic, timeout=timeout, phrase_time_limit=phrase_time_limit)
+        return self.recognizer.recognize_google(audio)
+    def speak_async(self, text):
+        if not self.tts:
+            return False
+        def _run():
+            try:
+                self.tts.say(text)
+                self.tts.runAndWait()
+            except Exception:
+                pass
+        thread(_run)
+        return True
+
+# ---------------- Camera helper (optional) ----------------
+class CameraHelper:
+    def __init__(self, device=0):
+        self.device = device
+        self.cap = None
+        self.running = False
+        self.frame = None
+    def start(self):
+        if cv2 is None:
+            raise RuntimeError("OpenCV not installed")
+        if self.running:
+            return
+        try:
+            if sys.platform.startswith("win"):
+                self.cap = cv2.VideoCapture(self.device, cv2.CAP_DSHOW)
+            else:
+                self.cap = cv2.VideoCapture(self.device)
+        except Exception:
+            self.cap = cv2.VideoCapture(self.device)
+        if not self.cap or not self.cap.isOpened():
+            raise RuntimeError("Could not open camera")
+        self.running = True
+        thread(self._loop)
+    def _loop(self):
+        while self.running and self.cap and self.cap.isOpened():
+            ok, frm = self.cap.read()
+            if ok:
+                self.frame = frm
+            time.sleep(0.02)
+        try:
+            if self.cap:
+                self.cap.release()
+        except Exception:
+            pass
+        self.running = False
+    def stop(self):
+        self.running = False
+    def get_tk_image(self, maxsize=(320,240)):
+        if self.frame is None or Image is None:
+            return None
+        import cv2 as _cv
+        rgb = _cv.cvtColor(self.frame, _cv.COLOR_BGR2RGB)
+        pil = Image.fromarray(rgb)
+        pil.thumbnail(maxsize)
+        return ImageTk.PhotoImage(pil)
+    def take_photo(self, filename):
+        if self.frame is None:
+            raise RuntimeError("No frame available")
+        import cv2 as _cv
+        _cv.imwrite(filename, self.frame)
+        return filename
+
+# ---------------- App ----------------
+class EchofiApp(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title("Echofi - Photo Share & Echofi AI")
+        self.geometry("980x640")
+        self.minsize(820,520)
+
+        # network
+        self.conn = None
+        self.conn_lock = threading.Lock()
+        self.chat_mode = None
+        self.server_side = False
+
+        # optional features
+        self.echofi_ai = None
+        self.voice = VoiceEngine() if (sr or pyttsx3) else None
+        self.camera = CameraHelper() if cv2 else None
+
+        # runtime
+        self.last_ai_reply = ""
+        self.last_taken_photo = None
+        self.last_received_photo = None
+        self.running = True
+        self.autoconnector = None
+
+        # build UI
+        self._build_ui()
+
+        # delayed init
+        self.after(700, self._deferred_start)
+
+        # close binding
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
+
+    def _build_ui(self):
+        # top status + controls
+        top = ttk.Frame(self)
+        top.pack(fill="x", padx=8, pady=(6,4))
+        self.status_var = tk.StringVar(value="Starting...")
+        self.status_lbl = ttk.Label(top, textvariable=self.status_var, font=("Segoe UI", 11, "bold"))
+        self.status_lbl.pack(side="left")
+
+        buttons = ttk.Frame(top)
+        buttons.pack(side="right")
+        ttk.Button(buttons, text="Save Chat", command=self._save_chat).pack(side="left", padx=4)
+        ttk.Button(buttons, text="Toggle Theme", command=self._toggle_theme).pack(side="left", padx=4)
+        ttk.Button(buttons, text="Camera", command=self._toggle_camera).pack(side="left", padx=4)
+        ttk.Button(buttons, text="Take Photo", command=self._take_photo).pack(side="left", padx=4)
+        ttk.Button(buttons, text="Send Photo", command=self._send_photo_dialog).pack(side="left", padx=4)
+        ttk.Button(buttons, text="Ask Echofi About Photo", command=self._ask_echofi_about_photo).pack(side="left", padx=4)
+
+        # main area
+        main = ttk.Frame(self)
+        main.pack(fill="both", expand=True, padx=8, pady=6)
+
+        # chat text
+        chat_frame = ttk.Frame(main)
+        chat_frame.pack(side="left", fill="both", expand=True)
+        self.chat_text = tk.Text(chat_frame, wrap="word", state="disabled", padx=10, pady=10, font=("Segoe UI", 12))
+        self.chat_text.pack(fill="both", expand=True)
+        sb = ttk.Scrollbar(chat_frame, command=self.chat_text.yview)
+        sb.pack(side="right", fill="y")
+        self.chat_text.config(yscrollcommand=sb.set)
+
+        # right: preview & info
+        right = ttk.Frame(main, width=280)
+        right.pack(side="right", fill="y")
+        ttk.Label(right, text="Preview / Info", font=("Segoe UI", 11, "bold")).pack(pady=(4,6))
+        self.cam_label = ttk.Label(right, text="Camera off", anchor="center", relief="sunken")
+        self.cam_label.pack(fill="both", expand=False, padx=6, pady=6, ipady=40)
+        self.info_label = ttk.Label(right, text="Local IP: —\nMode: —\nConnected: no", justify="left", anchor="nw")
+        self.info_label.pack(fill="both", padx=6, pady=(4,6))
+
+        # bottom: entry
+        bottom = ttk.Frame(self)
+        bottom.pack(fill="x", padx=8, pady=(0,8))
+        self.entry = ttk.Entry(bottom, font=("Segoe UI", 13))
+        self.entry.pack(side="left", fill="x", expand=True, ipady=6, padx=(0,8))
+        self.entry.bind("<KeyPress>", lambda e: self._maybe_send_typing())
+        self.entry.bind("<Return>", lambda e: self._on_send())
+        ttk.Button(bottom, text="Send", width=8, command=self._on_send).pack(side="left")
+
+        self._theme = "dark"
+        self._apply_theme()
+
+    def _deferred_start(self):
+        # Lazy init Echofi AI
+        if genai and API_KEY:
+            try:
+                self.echofi_ai = EchofiAI(API_KEY, ECHOFI_MODEL)
+                self._ui_log("[Echofi initialized]")
+            except Exception as e:
+                self._ui_log(f"[Echofi init error] {e}")
+        else:
+            self._ui_log("[Echofi not configured]")
+
+        # start auto connector
+        self.autoconnector = AutoConnector(self)
+        self._ui_log("[AutoConnector running]")
+
+        # camera preview loop
+        self.after(200, self._camera_preview_update)
+
+    # ---------------- UI helpers ----------------
+    def _apply_theme(self):
+        if self._theme == "dark":
+            self.configure(bg="#0f1720")
+            self.chat_text.configure(bg="#0f2433", fg="#e6eef6", insertbackground="#e6eef6")
+            self.cam_label.configure(background="#0f2433", foreground="#e6eef6")
+            self.info_label.configure(background="#0f1720", foreground="#bcdffb")
+            self.status_lbl.configure(background="#0f1720", foreground="#8fd4ff")
+        else:
+            self.configure(bg="#f3f7fb")
+            self.chat_text.configure(bg="#ffffff", fg="#001", insertbackground="#001")
+            self.cam_label.configure(background="#ffffff", foreground="#001")
+            self.info_label.configure(background="#f3f7fb", foreground="#003")
+            self.status_lbl.configure(background="#f3f7fb", foreground="#333")
+
+    def _toggle_theme(self):
+        self._theme = "light" if self._theme=="dark" else "dark"
+        self._apply_theme()
+
+    def _ui_log(self, text):
+        ts = now_ts()
+        def _append():
+            self.chat_text.configure(state="normal")
+            self.chat_text.insert("end", f"[{ts}] {text}\n\n")
+            self.chat_text.configure(state="disabled")
+            self.chat_text.see("end")
+        if threading.current_thread() is threading.main_thread():
+            _append()
+        else:
+            self.after(0, _append)
+
+    def _set_status(self, text):
+        def _set():
+            self.status_var.set(text)
+        if threading.current_thread() is threading.main_thread():
+            _set()
+        else:
+            self.after(0, _set)
+        self._refresh_info()
+
+    def _refresh_info(self):
+        ip = get_local_ip()
+        mode = self.chat_mode or "none"
+        conn = "yes" if self.conn else "no"
+        txt = f"Local IP: {ip}\nMode: {mode}\nConnected: {conn}\nTimeout: {SOCKET_TIMEOUT}s"
+        self.info_label.configure(text=txt)
+
+    # ---------------- camera preview ----------------
+    def _camera_preview_update(self):
+        try:
+            if self.camera and self.camera.running and Image is not None:
+                img = self.camera.get_tk_image(maxsize=(260,160))
+                if img:
+                    self.cam_label.configure(image=img, text="")
+                    self.cam_label.image = img
+            else:
+                if self.camera and self.camera.running:
+                    self.cam_label.configure(text="Camera running", image="")
+                else:
+                    self.cam_label.configure(text="Camera off", image="")
+        except Exception:
+            pass
+        if self.running:
+            self.after(200, self._camera_preview_update)
+
+    def _toggle_camera(self):
+        if not self.camera:
+            self._ui_log("[Camera not available (opencv/pillow missing)]")
+            return
+        if not self.camera.running:
+            try:
+                self.camera.start()
+                self._ui_log("[Camera started]")
+            except Exception as e:
+                self._ui_log(f"[Camera start error] {e}")
+        else:
+            self.camera.stop()
+            self._ui_log("[Camera stopped]")
+
+    def _take_photo(self):
+        if not self.camera:
+            self._ui_log("[Camera not available]")
+            return
+        if not self.camera.running:
+            self._ui_log("[Camera not running — start camera first]")
+            return
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = os.path.join(PHOTOS_DIR, f"echofi_photo_{ts}.jpg")
+        try:
+            self.camera.take_photo(filename)
+            self.last_taken_photo = filename
+            self._ui_log(f"[Photo saved: {filename}]")
+            messagebox.showinfo("Photo saved", f"Saved to:\n{filename}")
+        except Exception as e:
+            self._ui_log(f"[Photo error] {e}")
+            messagebox.showerror("Photo", f"Failed to save photo: {e}")
+
+    # ---------------- send photo dialog ----------------
+    def _send_photo_dialog(self):
+        choices = []
+        if self.last_taken_photo and os.path.isfile(self.last_taken_photo):
+            choices.append(("Last taken photo", self.last_taken_photo))
+        file = filedialog.askopenfilename(title="Select image to send",
+                                          filetypes=[("Images","*.png;*.jpg;*.jpeg;*.bmp"),("All files","*.*")])
+        if not file:
+            return
+        self._ui_log(f"[Sending photo: {file}]")
+        thread(lambda: self._send_file_over_conn(file))
+
+    # ---------------- send a file over the current connection (if peer) ----------------
+    def _send_file_over_conn(self, filepath):
+        if not self.conn:
+            self._ui_log("[Not connected to a peer — cannot send file]")
+            return
+        try:
+            with open(filepath, "rb") as f:
+                data = f.read()
+        except Exception as e:
+            self._ui_log(f"[Send file error] Could not read file: {e}")
+            return
+
+        filename = os.path.basename(filepath).replace("|","_")
+        size = len(data)
+        header = f"FILE|{filename}|{size}\n".encode("utf-8")
+        try:
+            with self.conn_lock:
+                self.conn.sendall(header)
+                sent = 0
+                CH = 4096
+                while sent < size:
+                    chunk = data[sent:sent+CH]
+                    self.conn.sendall(chunk)
+                    sent += len(chunk)
+            self._ui_log(f"[Photo sent: {filename} ({size} bytes)]")
+        except Exception as e:
+            self._ui_log(f"[Send file error] {e}")
+            self._handle_disconnect_and_reconnect()
+
+    # ---------------- ask Echofi AI about last photo ----------------
+    def _ask_echofi_about_photo(self):
+        target = None
+        if self.last_received_photo and os.path.isfile(self.last_received_photo):
+            target = self.last_received_photo
+        elif self.last_taken_photo and os.path.isfile(self.last_taken_photo):
+            target = self.last_taken_photo
+        else:
+            file = filedialog.askopenfilename(title="Select image to ask about",
+                                          filetypes=[("Images","*.png;*.jpg;*.jpeg;*.bmp"),("All files","*.*")])
+            if not file:
+                return
+            target = file
+
+        if not target:
+            self._ui_log("[No photo available to ask about]")
+            return
+
+        if genai is None or not API_KEY:
+            self._ui_log("[Echofi AI not configured — cannot analyze image]")
+            messagebox.showinfo("Echofi AI not available", "Echofi AI not configured or google-generativeai not installed.")
+            return
+
+        try:
+            with open(target, "rb") as f:
+                b = f.read()
+            b64 = base64.b64encode(b).decode("ascii")
+        except Exception as e:
+            self._ui_log(f"[Photo read error] {e}")
+            return
+
+        self._ui_log("[Asking Echofi about photo — this may take a moment]")
+        self._set_status("🤖 Echofi analyzing image...")
+
+        def _ask():
+            try:
+                prompt = ("Please analyze the following image (base64). Summarize the scene, "
+                          "list main objects, detect text if any, and give suggestions."
+                          "\n\nBASE64_IMAGE_START\n" + b64 + "\nBASE64_IMAGE_END")
+                wrapper = EchofiAI(API_KEY, ECHOFI_MODEL)
+                reply = wrapper.reply(prompt)
+            except Exception as e:
+                reply = f"[Echofi AI error] {e}"
+            self.last_ai_reply = reply
+            self._ui_log("Echofi: " + reply)
+            self._set_status("🤖 Echofi ready")
+            if self.voice and self.voice.tts:
+                try: self.voice.speak_async(reply)
+                except Exception: pass
+
+        thread(_ask)
+
+    # ---------------- typing heartbeat ----------------
+    def _maybe_send_typing(self):
+        if self.conn:
+            def _send():
+                try:
+                    with self.conn_lock:
+                        if self.conn:
+                            self.conn.sendall(b"__typing__")
+                except Exception:
+                    pass
+            thread(_send)
+
+    # ---------------- send text ----------------
+    def _on_send(self):
+        text = self.entry.get().strip()
+        if not text:
+            return
+        self.entry.delete(0, "end")
+        self._ui_log("You: " + text)
+        if self.conn:
+            try:
+                with self.conn_lock:
+                    self.conn.sendall(text.encode("utf-8"))
+            except Exception as e:
+                self._ui_log(f"[Send failed] {e}")
+                self._handle_disconnect_and_reconnect()
+        else:
+            if self.echofi_ai:
+                self._set_status("🤖 Echofi thinking...")
+                def _ask():
+                    try:
+                        reply = self.echofi_ai.reply(text)
+                    except Exception as e:
+                        reply = f"[Echofi AI error] {e}"
+                    self.last_ai_reply = reply
+                    self._ui_log("Echofi: " + reply)
+                    self._set_status("🤖 Echofi ready")
+                    if self.voice and self.voice.tts:
+                        try: self.voice.speak_async(reply)
+                        except Exception: pass
+                thread(_ask)
+            else:
+                self._ui_log("[No peer and Echofi AI not configured]")
+
+    # ---------------- save chat ----------------
+    def _save_chat(self):
+        data = self.chat_text.get("1.0","end-1c")
+        if not data.strip():
+            messagebox.showinfo("Save chat","No messages to save.")
+            return
+        path = filedialog.asksaveasfilename(defaultextension=".txt", filetypes=[("Text files","*.txt")])
+        if not path:
+            return
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(data)
+            self._ui_log(f"[Chat saved to {path}]")
+        except Exception as e:
+            messagebox.showerror("Save chat", f"Failed: {e}")
+
+    # ---------------- disconnect handling ----------------
+    def _handle_disconnect_and_reconnect(self):
+        try:
+            with self.conn_lock:
+                if self.conn:
+                    try: self.conn.close()
+                    except: pass
+                    self.conn = None
+        except Exception:
+            pass
+        self.chat_mode = None
+        self._set_status("🔁 Reconnecting...")
+        def _retry():
+            time.sleep(RECONNECT_DELAY)
+            if self.autoconnector:
+                self.autoconnector.trigger_scan_now()
+        thread(_retry)
+
+    # ---------------- close ----------------
+    def _on_close(self):
+        self.running = False
+        try:
+            if self.camera:
+                self.camera.stop()
+        except Exception:
+            pass
+        try:
+            if self.autoconnector:
+                self.autoconnector.stop()
+        except Exception:
+            pass
+        try:
+            with self.conn_lock:
+                if self.conn:
+                    self.conn.close()
+        except Exception:
+            pass
+        self.destroy()
+
+# ---------------- AutoConnector (NO loopback self-connect) ----------------
+class AutoConnector:
+    def __init__(self, app, scan_interval=8):
+        self.app = app
+        self.scan_interval = scan_interval
+        self.running = True
+        self._scan_now = threading.Event()
+        thread(self._watch_loop)
+
+    def stop(self):
+        self.running = False
+        self._scan_now.set()
+
+    def trigger_scan_now(self):
+        self._scan_now.set()
+
+    def _watch_loop(self):
+        while self.running:
+            try:
+                if self.app.chat_mode != "peer":
+                    self._discovery_cycle()
+            except Exception as e:
+                print("AutoConnector error:", e)
+            self._scan_now.wait(self.scan_interval)
+            self._scan_now.clear()
+
+    def _discovery_cycle(self):
+        found_event = threading.Event()
+        peer_holder = []
+        thread(self._udp_listener, found_event, peer_holder)
+        thread(self._udp_broadcaster, found_event)
+        waited = 0.0
+        timeout = 6.0
+        while not found_event.is_set() and waited < timeout and self.running:
+            time.sleep(0.2)
+            waited += 0.2
+
+        if found_event.is_set() and peer_holder:
+            peer_ip = peer_holder[0]
+            try:
+                self.app._set_status(f"🔗 Connecting to {peer_ip}...")
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.settimeout(SOCKET_TIMEOUT)
+                sock.connect((peer_ip, CHAT_PORT))
+                self.app._bind_socket_as_client(sock, peer_ip)
+                return
+            except Exception as e:
+                self.app._ui_log(f"[AutoConnect] connect to {peer_ip} failed: {e}")
+        # try hosting briefly
+        try:
+            self.app._set_status(f"🟠 Hosting on port {CHAT_PORT} (waiting)...")
+            serv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            serv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            serv.bind(("", CHAT_PORT))
+            serv.listen(1)
+            serv.settimeout(6)
+            try:
+                conn, addr = serv.accept()
+                self.app._bind_socket_as_client(conn, addr[0], server_side=True)
+                serv.close()
+                return
+            except socket.timeout:
+                serv.close()
+        except Exception as e:
+            self.app._ui_log(f"[Hosting failed] {e}")
+        if self.app.echofi_ai:
+            self.app._set_status("🤖 Echofi ready (no peers)")
+        else:
+            self.app._set_status("Ready (no peers)")
+
+    def _udp_broadcaster(self, found_event):
+        try:
+            local_ip = get_local_ip()
+            msg = f"ECHOFI_DISCOVERY:{local_ip}".encode()
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+            for _ in range(6):
+                if found_event.is_set() or not self.running:
+                    break
+                s.sendto(msg, ("<broadcast>", BROADCAST_PORT))
+                time.sleep(DISCOVER_INTERVAL)
+            s.close()
+        except Exception:
+            pass
+
+    def _udp_listener(self, found_event, peer_holder):
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            s.bind(("", BROADCAST_PORT))
+            s.settimeout(1.0)
+            local_ip = get_local_ip()
+            start = time.time()
+            while not found_event.is_set() and time.time()-start < 6 and self.running:
+                try:
+                    data, addr = s.recvfrom(2048)
+                    msg = data.decode(errors="ignore")
+                    if msg.startswith("ECHOFI_DISCOVERY:"):
+                        peer_ip = msg.split(":",1)[1]
+                        if peer_ip != local_ip:
+                            peer_holder.append(peer_ip)
+                            found_event.set()
+                            break
+                except socket.timeout:
+                    continue
+            s.close()
+        except Exception:
+            pass
+
+# ---------------- binding & receiving ----------------
+def _recv_loop_factory(app, sock):
+    def _recv_loop():
+        try:
+            sock.settimeout(SOCKET_TIMEOUT)
+            while True:
+                data = sock.recv(BUFFER_SIZE)
+                if not data:
+                    raise ConnectionError("socket closed by peer")
+                if data.startswith(b"FILE|"):
+                    header = data
+                    while b"\n" not in header:
+                        more = sock.recv(BUFFER_SIZE)
+                        if not more:
+                            raise ConnectionError("socket closed while reading header")
+                        header += more
+                    header_line, rest = header.split(b"\n",1)
+                    try:
+                        _, fname, szs = header_line.decode("utf-8").split("|",2)
+                        size = int(szs)
+                    except Exception:
+                        app._ui_log("[File header parse error]")
+                        continue
+                    save_name = f"{int(time.time())}_{os.path.basename(fname)}"
+                    save_path = os.path.join(RECV_PHOTOS_DIR, save_name)
+                    try:
+                        with open(save_path, "wb") as outf:
+                            if rest:
+                                outf.write(rest)
+                                received = len(rest)
+                            else:
+                                received = 0
+                            while received < size:
+                                chunk = sock.recv(min(BUFFER_SIZE, size - received))
+                                if not chunk:
+                                    raise ConnectionError("socket closed during file transfer")
+                                outf.write(chunk)
+                                received += len(chunk)
+                        app.last_received_photo = save_path
+                        app._ui_log(f"[Photo received: {save_path}]")
+                    except Exception as e:
+                        app._ui_log(f"[File save error] {e}")
+                    continue
+                else:
+                    try:
+                        text = data.decode("utf-8", errors="ignore")
+                    except Exception:
+                        continue
+                    if text == "__typing__":
+                        app._set_status("✍ Peer is typing...")
+                        app.after(2000, lambda: app._set_status("🟢 Connected" if app.conn else "Ready"))
+                    else:
+                        app._ui_log("Peer: " + text)
+                        if app.voice and app.voice.tts:
+                            app.voice.speak_async(text)
+        except Exception as e:
+            app._ui_log(f"[Peer connection closed: {e}]")
+        finally:
+            try:
+                with app.conn_lock:
+                    try: sock.close()
+                    except: pass
+                    if app.conn is sock:
+                        app.conn = None
+            except Exception:
+                pass
+            app.chat_mode = None
+            app._set_status("🔁 Reconnecting...")
+            if app.autoconnector:
+                app.autoconnector.trigger_scan_now()
+    return _recv_loop
+
+def _bind_socket_as_client(self, sock, peer_ip, server_side=False):
+    with self.conn_lock:
+        try:
+            if self.conn:
+                try: self.conn.close()
+                except: pass
+        except Exception:
+            pass
+        self.conn = sock
+        self.server_side = server_side
+        self.chat_mode = "peer"
+    self._set_status(f"🟢 Connected to {peer_ip}")
+    self._ui_log(f"[Peer connected: {peer_ip}]")
+    recv_loop = _recv_loop_factory(self, sock)
+    thread(recv_loop)
+
+EchofiApp._bind_socket_as_client = _bind_socket_as_client
+EchofiApp._set_status = EchofiApp._set_status  # ensure bound
+
+# ---------------- main ----------------
+def main():
+    app = EchofiApp()
+    app.mainloop()
+
+if __name__ == "__main__":
+    main()
